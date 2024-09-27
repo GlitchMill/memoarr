@@ -1,15 +1,34 @@
-use clap::{Arg, Command};
+use chrono::offset::LocalResult;
+use chrono::DateTime;
+use chrono::TimeZone; // Import the TimeZone trait
+use chrono_tz::Tz;
+use clap::Command;
+use html_escape::decode_html_entities;
+use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::Error as ReqwestError;
-use serde_json::Value;
-use std::fs;
-use std::process::exit;
-use std::collections::HashMap;
-use regex::Regex;
-use html_escape::decode_html_entities;
 use select::document::Document;
 use select::predicate::Name;
-use chrono::{DateTime, Utc};
+use serde::Deserialize;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::fs;
+use std::process::exit;
+
+#[derive(Deserialize)]
+struct Config {
+    mastodon_url: String,
+    output_file: String,
+    template_file: String,
+    timezone: String,
+}
+
+fn load_config(filename: &str) -> Result<Config, std::io::Error> {
+    let file = std::fs::File::open(filename)?;
+    let reader = std::io::BufReader::new(file);
+    let config: Config = serde_json::from_reader(reader)?;
+    Ok(config)
+}
 
 fn process_diary_content(content: &str) -> Option<String> {
     let doc = Document::from(content);
@@ -18,7 +37,7 @@ fn process_diary_content(content: &str) -> Option<String> {
         .map(|n| n.text())
         .collect::<Vec<_>>()
         .join("");
-    
+
     if text.starts_with("#Diary") {
         let diary_content = text.trim_start_matches("#Diary").trim().to_string();
         // Remove extra spaces, commas, and exclamation marks
@@ -29,31 +48,22 @@ fn process_diary_content(content: &str) -> Option<String> {
 }
 
 fn main() -> Result<(), ReqwestError> {
-    // Command line options
-    let matches = Command::new("mastodon_user_info")
+    let config = load_config("config.json").unwrap_or_else(|_| {
+        eprintln!("Error loading config.json");
+        std::process::exit(1);
+    });
+
+    // No command line arguments, only help
+    let _matches = Command::new("mastodon_user_info")
         .version("1.0")
         .about("Get all your Mastodon Posts as Diary")
-        .arg(Arg::new("url")
-            .help("URL of the Mastodon profile")
-            .default_value("https://mastodon.example/@username")
-        )
-        .arg(Arg::new("output")
-            .short('o')
-            .long("output")
-            .value_parser(clap::value_parser!(String))
-            .default_value("posts.html")
-        )
-        .arg(Arg::new("template")
-            .short('t')
-            .long("template")
-            .value_parser(clap::value_parser!(String))
-            .default_value("templates/retro_light.html")
-        )
         .get_matches();
-    
-    let mastodon_url = matches.get_one::<String>("url").unwrap();
-    let output_file = matches.get_one::<String>("output").unwrap();
-    let template_file = matches.get_one::<String>("template").unwrap();
+
+    // Use config values directly
+    let mastodon_url = &config.mastodon_url;
+    let output_file = &config.output_file;
+    let template_file = &config.template_file;
+    let timezone_str = &config.timezone;
 
     // Parse Mastodon URL
     let mastodon_host = match reqwest::Url::parse(mastodon_url) {
@@ -66,7 +76,10 @@ fn main() -> Result<(), ReqwestError> {
 
     let mastodon_username = mastodon_url.split('/').last().unwrap();
 
-    let user_lookup_api = format!("https://{}/api/v1/accounts/lookup?acct={}", mastodon_host, mastodon_username);
+    let user_lookup_api = format!(
+        "https://{}/api/v1/accounts/lookup?acct={}",
+        mastodon_host, mastodon_username
+    );
 
     // Fetch user data
     let client = Client::new();
@@ -80,18 +93,22 @@ fn main() -> Result<(), ReqwestError> {
         }
     };
 
-    let user_timeline_api = format!("https://{}/api/v1/accounts/{}/statuses", mastodon_host, user_id);
-    
+    let user_timeline_api = format!(
+        "https://{}/api/v1/accounts/{}/statuses",
+        mastodon_host, user_id
+    );
+
     let mut all_posts = Vec::new();
     let mut params = HashMap::new();
-    
+
     // Fetch all posts
     loop {
-        let response: Vec<Value> = client.get(&user_timeline_api)
+        let response: Vec<Value> = client
+            .get(&user_timeline_api)
             .query(&params)
             .send()?
             .json()?;
-        
+
         if response.is_empty() {
             break;
         }
@@ -113,6 +130,26 @@ fn main() -> Result<(), ReqwestError> {
     let mut post_entries = Vec::new();
     let mut last_date = None;
 
+    // Get the timezone
+    let timezone: Tz = match timezone_str.parse() {
+        Ok(tz) => tz,
+        Err(_) => {
+            eprintln!("Invalid timezone format: {}", timezone_str);
+            exit(1);
+        }
+    };
+
+    // Get current time in the specified timezone
+let current_time = match timezone.from_local_datetime(&chrono::Local::now().naive_utc()) {
+    LocalResult::Single(dt) => dt,
+    LocalResult::Ambiguous(dt1, dt2) => dt1, // or choose dt2 based on your preference
+    LocalResult::None => {
+        eprintln!("Unable to get current time in specified timezone.");
+        exit(1);
+    }
+};
+
+
     for post in &all_posts {
         let created_at = post["created_at"].as_str().unwrap_or("");
         let content = post["content"].as_str().unwrap_or("").trim();
@@ -126,9 +163,9 @@ fn main() -> Result<(), ReqwestError> {
         }
 
         let created_at_dt = DateTime::parse_from_rfc3339(created_at)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
-        
+            .map(|dt| dt.with_timezone(&timezone))
+            .unwrap_or(current_time);
+
         let formatted_date = created_at_dt.format("%d/%m/%Y").to_string();
         let formatted_time = created_at_dt.format("%I:%M %p").to_string();
 
